@@ -1,0 +1,6 @@
+
+set -x
+sudo mknod /dev/chardriver0 c 311 0
+
+
+

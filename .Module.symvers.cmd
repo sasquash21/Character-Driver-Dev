@@ -1,0 +1,1 @@
+cmd_/home/sashrao/Documents/ProgrammingWS/CLearner/Drivers/Module.symvers :=  scripts/mod/modpost -m -a     -o /home/sashrao/Documents/ProgrammingWS/CLearner/Drivers/Module.symvers -T /home/sashrao/Documents/ProgrammingWS/CLearner/Drivers/modules.order -i Module.symvers -e 
