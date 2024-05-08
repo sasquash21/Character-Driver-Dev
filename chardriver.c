@@ -1,18 +1,27 @@
-/*  In this character driver, I demonstrate how to manipulate a hardware buffer by implementing chardriver_init, _open, _read, _write, 
- *  _ioctl, and mmap functions. Through this process, I also learned how to create test cases for each of these functions and learned 
- *  how to debug Kernel level code using CD_DEBUG.  This driver's major number is 311 and the driver can support up to 3 devices of the
- *  major driver type.
+/*  This character driver demonstrates  _init, _open, _read, _write,  _ioctl, and mmap functions. 
+*  This driver manipulates a kmalloc'ed buffer of size 4K as HW. The chardriver is used as a vehicle to
+*  learn the kernel driver interfaces available in general purpose linux. This driver implements all the driver entry points
+* mentioned above and have been tested for the functionality and semantics implemented using individual test cases.
+*  As part of debugging, macros like CD_DEBUG were used for
+* different problems seen during development. This driver controls three different instances of HW buffer with distinct minor numbers. 
+*  A distinct driver state structure is maintained for managing different instances of the Pseudo HW buffer.
+*  The unused major number is allocated for this chardriver using the rules laid out in linux for allocating major numbers.
 */
+
 
 #include "chardriver.h"
 
 
 struct chardriver_data devs[CHARDRIVER_MAX_MINORS];
 
-/* User can access a hardware buffer with Open exlcusive, write, read, read/write. In this function I check for whether there is an
- * open exclusive device, in which another minor device cannot be used or open.  If another device is open and a open exlusive
- * is issued then we will deny the open exclusive and wait for the other minor devices to free up. When issuing an open we need
- * a mutex in order to make sure that the hardware buffer is not corrupted when the other minor devices are accessing the buffer.
+/*Users can open an HW (pseudo  hardware buffer)using the chardriver node created using mknode - with Open using different flags, O_EXCL - exclusive, O_WRONLY - write, 
+* O_RDONLY - read, O_RDWR- read/write.  Each such open from a user level process is maintained in the driver state structure.
+* Only one user can hold exclusive access, if already a user has opened the  device
+* and another user is requesting  exclusive access, such an open request will be failed with error code. 
+* This driver allows only for the MAX_ALLOWED_OPEN number of opens, beyond which it will reject opening the device. 
+* Throughout  the driver to maintain synchronization of the pseudo HW buffer in multi-threaded or Multi-process use cases, mutex is 
+* used to provide such synchronization on each instance of the HW buffer. This also maintains statistics pertaining to this entry point, both
+* the open success and failure counts.
 */
 int chardriver_open(struct inode *inp, struct file *p){
 
@@ -90,9 +99,10 @@ int chardriver_open(struct inode *inp, struct file *p){
 
 }
 
-/* This function releases a file stucture. I find the right file by looking at the filep pointer stored in the chardriver_data structure.  
-After we find the right device file to close, we set the device file's open state to close. We also set the owner to INVALID_PID and the 
-file pointer to NULL. The open state is what determines whether a new open can be issued. 
+/* This  entry point will be called whenever the application closes the character device node.  This entry point identifies the appropriate
+* open state maintained in the driver state structure and marks the state of the open corresponding to this process ID to be closed. Once such
+* open state is marked closed, we also mark such open state slots to be available for managing other opens that might come from other applications.
+* This also maintains stats for successful close accomplished by this routine. 
 */
 int chardriver_release(struct inode *inp, struct file *p){
     
@@ -142,14 +152,15 @@ int chardriver_release(struct inode *inp, struct file *p){
     return 0;
 
 }
-/*The llseek function is used to change the current read/write position of the file. Here I read the offset bytes in accordance to the whence
-condition.
-1. If whence is SEEK_SET, the file position will be set to offset byte from the beginning.  I make sure that if the offset is greater than
-the buffer size, I set the file position to the end.
-2. If whence is SEEK_CUR, the file position will be set to the offset byte from the current file position.  I check if the file position is
-greater than the buffer size, the file position is set to chardriver buffer size
-3. If whence is SEEK_ENDm the file position is set to chardriver buffer size
-Return the file position
+/*The llseek function is used to change the current read/write position of the device node file maintaining the Psuedo HW buffer. 
+* This entry points returns the file offset  in accordance to the whence condition.
+*  1.  If whence is SEEK_SET, the file position will be set to offset byte from the beginning.  This entry point validates  if the offset is greater than
+*       the Pseudo HW buffer size managed, it will set the file position to the end.
+*  2.  If whence is SEEK_CUR, the file position will be set to the offset byte from the current file position.  This entry point validates if the file position is
+*       greater than the pseudo HW  buffer size, the file position is set to chardriver buffer size. If a negative offer is provide by the user, this entry point validates
+*       the file position does not go below zero as well.
+*  3.  If whence is SEEK_END the file position is set to end of pseudo HW Buffer size
+*  lseek stats to be implemented yet.
 */
 loff_t chardriver_llseek(struct file *p, loff_t offset, int whence){
     if(whence == SEEK_SET){
@@ -176,11 +187,15 @@ loff_t chardriver_llseek(struct file *p, loff_t offset, int whence){
 }
 
 
-/*This function is used to retrieve data from the hardware buffer. I first find the device file that needs to be read from. Then we put the
-contents of the hardware buffer into the user buffer buffp with the copy_to_user function, passing along with it the offset bytes for the hardware
-buffer and the bytes to be read. I also check for whether the open mode is in Write only in which the driver does not allow a read and returns
-an error. I check if the n_bytes and offset to be read are also larger than the hardware buffer size in which I also return an error. Lastly,
-I also check if the user provided buffer buffp is a NULL. If it is NULL we return an error.  
+/*This entry point is called whenever the application/user code issues a read system call to read the contents of the pseudo HW buffer.  
+*  This routine validates whether the application has opened the device node in appropriate mode to read the data from a pseudo HW buffer.
+*  if the requested data > greater than the HW Buffer size, the read request is failed with EINVAL as error code.
+* This routine  returns the requested amount of data from the current file pointer  if the amount of data requested is available in the pseudo HW
+* buffer. If the requested size exceeds  the amount available in the HW buffer from the current file position, this driver satisfies the read with partial data
+* available until the end of the pseudo HW buffer and returns appropriately to reflect the amount of data returned. Once the data is returned, the offset is adjusted
+* to make sure the file pointer reflects the position required to read the next byte from HW Buffer.
+* The contents of the HW buffer is moved to the user virtual address using the Kernel API copy_to_user.  This entry point validates the destination
+* buffer to make sure it is a valid buffer before initiating a copy to the user virtual address. This entry point maintains stats on both successful and failed reads.
 */
 ssize_t chardriver_read(struct file *p, char *buffp, size_t n_byte, loff_t *offset){
     
@@ -273,9 +288,15 @@ ssize_t chardriver_read(struct file *p, char *buffp, size_t n_byte, loff_t *offs
     return bytes_to_read;
 }
 
-/* The write sends data to the device. This function is like read however the function used is copy_from_user.  Our error cases are to return
-an error if the open state of the file is OPEN_RDONLY.  I also return an error if the offset and n_bytes thats written to is larger than the
-hardware buffer size.  An error is returned if buffp is null as well.
+/* This entry point is called whenever the application/user code issues a write system call to write the contents of the pseudo HW buffer.  
+*  This routine validates whether the application has opened the device node in appropriate mode to write  data into the pseudo HW buffer.
+*  if the requested data > greater than the HW Buffer size, the write request fails with EINVAL as error code.
+* This routine  returns the amount of data written into the pseudo HW buffer.   If the requested write size exceeds  the amount of space available in 
+ * the HW buffer from the current file position, this driver satisfies the write by writing  partial data
+* into the pseudo HW buffer and returns appropriately to reflect the amount of data written. Once the data is written, the offset is adjusted
+* to make sure the file pointer reflects the position required to read/write the next byte from/into the HW Buffer.
+* The contents of the data provided by the user application is copied into the pseudo HW buffer using the kernel API copy_from_user.  This entry point validates the source
+* buffer to make sure it is a valid buffer before initiating a copy_from_user routine.  This entry point maintains stats on both successful and failed writes.
 */
 ssize_t chardriver_write(struct file *p, const char *buffp, size_t n_byte, loff_t *offset){
 
@@ -362,7 +383,8 @@ ssize_t chardriver_write(struct file *p, const char *buffp, size_t n_byte, loff_
     return bytes_to_write;
 }
 
-/*Status handler returns device stats of device to user (&cp->devicestats). These device stats show:
+/*Status handler returns device stats of device to user (&cp->devicestats).The device stats structure maintains the different happy
+ * path and failure path stats for each entrypoint. This is an helper routine to  implement the GET_DEVICE_STATS ioctl. These device stats show:
      opencount;
      closecount;
      readcount;
@@ -393,9 +415,12 @@ long statsreturn_handler(struct chardriver_data *cp, unsigned long param){
     return 0;
 }
 
-/*Change buffersize allows user to change the buffer size to any mutliple of 4096 bytes. I check for whether the the device is in Open exclusive.
-If it is not in open exclusive I return an error.  I check if the new buffer size is same as the old buffer size, I return an error.  When
-allocating a new size, we kfree the existing hardware buffer and kmalloc a new buffer that is a multiple of 4096 bytes.
+/* This is the  helper routine to implement the change pseudo HW Buffer size ioctl. By default the driver allocates 4K buffer using kmalloc for
+* use as a pseudo HW Buffer. This ioctl provides a means to change that pseudo HW Buffer to be of a different bigger size buffer(only multiples of 4K allowed). 
+* This routine expects the application which is issuing this ioctl to hold exclusive access to the device node, so that pseudo HW buffer size can be changed
+* without affecting the functionality of other applications which might have opened and using this pseudo HW buffer.
+* the current HW Buffer size is maintained in the driver state structure. 
+* TBD: still the error checks in various entry points are using the default HW buffer size (#define), but should validate against the buffer size maintained in state structure.
 */
 long changebuffersize_handler(struct chardriver_data *cp, unsigned long param){
 
@@ -437,11 +462,11 @@ long changebuffersize_handler(struct chardriver_data *cp, unsigned long param){
     return 0;
 }
 
-/*Ioctl functions covered above
-Returns drivers stats
-Changes buffer size
-Gets buffer size
-returns these values to user based off of what is called
+/* Implements the ioctl entry points.
+* support the following IOCTLs.
+* 1. CHARDRIVER_IOCTL_RETURN_STATS:
+* 2. CHARDRIVER_IOCTL_CHANGE_BUFFERSIZE
+* 3.  CHARDRIVER_IOCTL_CHANGE_BUFFERSIZ
 */
 long chardriver_ioctl(struct file *p, unsigned int cmd, unsigned long param){
 
@@ -466,7 +491,8 @@ long chardriver_ioctl(struct file *p, unsigned int cmd, unsigned long param){
     }
     return retval;
 }
-//This function is used to take count of the amount of mmap called
+//This function implements the VM area operations entry point open.
+//This function is done to reliably count the stats on the number of mmaps handled by this driver.
 void vma_open(struct vm_area_struct *vma){
 
     struct file *p;
@@ -482,7 +508,8 @@ void vma_open(struct vm_area_struct *vma){
     CD_DEBUG("mmap was called vma is open: %p", vma);
 
 }
-//This function is used to take count of the amount of munmaps called
+//This function implements the VM area operations entry point close.
+//This entry point is the only place where one could count the number of unmaps handled by this driver instance.
 void vma_close(struct vm_area_struct *vma){
 
     struct file *p;
@@ -502,10 +529,11 @@ static struct vm_operations_struct chardriver_vm_ops = {
     open: vma_open,
     close: vma_close,
 };
-/*This function is used to request mapping to the hardware buffer. This function had me go deeper into vm_area_struct on elixir bootlin.
-When mapping we have to make sure that VM_SYNC is enabled in the vma->vm_flags.  By calling virt_to_phys I get the physical address of the
-hwptr. I then derive the page frame number to which the virtual address should be mapped.  Then the remap_pfn_range function maps a physical
-address space into the virtual space using the vm_area_struct.
+/*This entry point implements a simple mmap operation of the pseudo HW buffer.  
+* This function had me go deeper into vm_area_struct on elixir bootlin. When mapping, make sure that VM_SYNC is enabled in the vma->vm_flags, so that the 
+* write is reflected immediately to other processes and synchronization happens as soon as the write to mmaped buffer is complete from one process. 
+* By calling virt_to_phys I get the physical address of the hwptr. The entry point derives the page frame number to which the virtual address should be mapped. 
+* Then call the remap_pfn_range function to  map a physical address of the pseudo HW buffer into the virtual space using the vm_area_struct.
 */
 int chardriver_mmap(struct file *p, struct vm_area_struct *vma){
     
@@ -539,7 +567,7 @@ int chardriver_mmap(struct file *p, struct vm_area_struct *vma){
 
     return 0;
 }
-//These are the file operations used in the driver. We use and implement open, read, write, release, ioctl, mmap, and llseek.
+//These are the file operations/entry points implemented by this driver. The chardriver sets up entry points for open, read, write, release, ioctl, mmap, and llseek.
 const struct file_operations chardriver_fops = {
     .owner = THIS_MODULE,
     .open = chardriver_open,
@@ -551,9 +579,13 @@ const struct file_operations chardriver_fops = {
     .llseek = chardriver_llseek,
 };
 
-/*After creating the node and assigning a Major number, the Chardriver _init function is where I register the character driver.  
- This function is called when we insmod the driver. I initialize the chardriverdata structure for the minor devices here to either
- 0 or NULL.
+/*This driver is written as a loadable module. This entry point is set up to be called using module_init macro. during the time a load of this driver is requested by 
+* insmod  driver load application.
+*
+* The Chardriver _init function used to register the character driver with the required/unused major number and also declare how many
+* instances of such device nodes can be managed by this driver. This also allocates as many driver state structure for each such instance to
+* be managed and initializes the structure to a clean state. This also allocates the default size pseudo HW buffer required for each instance and 
+* initializes the buffer point in the driver state structure for that instance.
 */
 static int __init chardriver_init(void)
 {
@@ -614,7 +646,11 @@ initexit:
    return -1;
 }
 
-//Exit chardriver frees the hardware structure and unregisters the driver. This is done by calling rmmod.
+/*This entry point is set up to be called using module_exit macro, during the time a unload of this driver is requested by 
+* rmmod  driver unload application.
+* The chardriver_exit entry point releases all the resources allocated during _init entry point and make sure the driver tears down
+* all the allocated resources in an orderly manner.
+*/
 static void __exit chardriver_exit(void)
 {
     pr_info("first driver exit\n");
